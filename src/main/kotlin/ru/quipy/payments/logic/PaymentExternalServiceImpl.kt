@@ -14,6 +14,7 @@ import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
 
@@ -41,8 +42,19 @@ class PaymentExternalSystemAdapterImpl(
     private val client = OkHttpClient.Builder().build()
     private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
     private val parallelRequestsLimiter = OngoingWindow(parallelRequests)
+    private val paymentExecutor = Executors.newFixedThreadPool(parallelRequests)
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
+        paymentExecutor.submit {
+            try {
+                executePayment(paymentId, amount, paymentStartedAt, deadline)
+            } catch (e: Exception) {
+                logger.error("[$accountName] Failed to process payment $paymentId", e)
+            }
+        }
+    }
+
+    private fun executePayment(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
 
         val transactionId = UUID.randomUUID()
