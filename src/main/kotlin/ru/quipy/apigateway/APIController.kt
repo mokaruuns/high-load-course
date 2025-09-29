@@ -59,7 +59,7 @@ class APIController {
     }
 
     @PostMapping("/orders/{orderId}/payment")
-    fun payOrder(@PathVariable orderId: UUID, @RequestParam deadline: Long): PaymentSubmissionDto {
+    fun payOrder(@PathVariable orderId: UUID, @RequestParam deadline: Long): ResponseEntity<PaymentSubmissionDto> {
         val paymentId = UUID.randomUUID()
         val order = orderRepository.findById(orderId)?.let {
             orderRepository.save(it.copy(status = OrderStatus.PAYMENT_IN_PROGRESS))
@@ -67,30 +67,22 @@ class APIController {
         } ?: throw IllegalArgumentException("No such order $orderId")
 
 
-        val createdAt = orderPayer.processPayment(orderId, order.price, paymentId, deadline)
-        return PaymentSubmissionDto(createdAt, paymentId)
+        try {
+            val createdAt = orderPayer.processPayment(orderId, order.price, paymentId, deadline)
+            return ResponseEntity.ok(PaymentSubmissionDto(createdAt, paymentId))
+        } catch (exception: PaymentRejectedException) {
+            logger.warn("Payment rejected due to high load: ${exception.message}") // Не забудьте логгер
+
+            return ResponseEntity
+                .status(HttpStatus.TOO_MANY_REQUESTS)
+                .header(HttpHeaders.RETRY_AFTER, "${exception.estimatedCompletionTimestamp}")
+                .build()
+        }
+
     }
 
     class PaymentSubmissionDto(
         val timestamp: Long,
         val transactionId: UUID
     )
-
-    @ExceptionHandler(PaymentRejectedException::class)
-    fun handlePaymentRejected(exception: PaymentRejectedException): ResponseEntity<Map<String, Any>> {
-        logger.warn("Payment rejected due to high load: ${exception.message}") // Не забудьте логгер
-
-        // Формируем правильные заголовки
-        val headers = HttpHeaders()
-        headers.add("Retry-After", exception.retryAfter.seconds.toString())
-
-        // Формируем тело ответа
-        val body = mapOf(
-            "error" to "TOO_MANY_REQUESTS",
-            "message" to "Service is currently overloaded. Please try again later.",
-            "retryAfterSeconds" to exception.retryAfter.seconds
-        )
-
-        return ResponseEntity(body, headers, HttpStatus.TOO_MANY_REQUESTS)
-    }
 }

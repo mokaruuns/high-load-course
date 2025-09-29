@@ -6,7 +6,6 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
 import org.slf4j.LoggerFactory
-import ru.quipy.common.utils.FixedWindowRateLimiter
 import ru.quipy.common.utils.OngoingWindow
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
@@ -15,12 +14,11 @@ import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
 import java.util.concurrent.*
+import kotlin.math.min
 
 
-class PaymentRejectedException(val retryAfter: Duration) :
-    RuntimeException("Payment rejected due to high load. Retry after ${retryAfter.seconds} seconds.") {
-    // Оптимизация: нам не нужен дорогой stack trace для этого типа исключений,
-    // так как это ожидаемое поведение при перегрузке.
+class PaymentRejectedException(val estimatedCompletionTimestamp: Long) :
+    RuntimeException("Payment rejected due to high load. Retry after $estimatedCompletionTimestamp timestamp.") {
     override fun fillInStackTrace(): Throwable = this
 }
 
@@ -49,22 +47,25 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
     private val parallelRequestsLimiter = OngoingWindow(parallelRequests)
 
-    private val queueCapacity = 100
+//    private val queueCapacity = 2000
     private val paymentExecutor: ThreadPoolExecutor = ThreadPoolExecutor(
         parallelRequests,
         parallelRequests,
         60L, TimeUnit.SECONDS,
-        LinkedBlockingQueue<Runnable>(queueCapacity)
+        LinkedBlockingQueue<Runnable>()
     )
 
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
+        throw PaymentRejectedException(deadline)
         val currentQueueSize = paymentExecutor.queue.size
-        if (currentQueueSize >= queueCapacity) {
-            throw PaymentRejectedException(requestAverageProcessingTime)
-        }
+//        if (currentQueueSize >= queueCapacity) {
+//            throw PaymentRejectedException(requestAverageProcessingTime)
+//        }
 
-        val estimatedWaitTime = (currentQueueSize / parallelRequests) * requestAverageProcessingTime.toMillis()
+        val parallelSpeed = parallelRequests * 1000 / requestAverageProcessingTime.toMillis()
+        val speed = min(parallelSpeed, rateLimitPerSec.toLong())
+        val estimatedWaitTime = currentQueueSize / speed * 1000
         val estimatedCompletionTime = System.currentTimeMillis() + estimatedWaitTime
 
         if (estimatedCompletionTime > deadline) {
@@ -72,7 +73,7 @@ class PaymentExternalSystemAdapterImpl(
                 "[$accountName] Rejecting payment $paymentId due to high load. " +
                         "Queue size: $currentQueueSize, estimated wait: ${estimatedWaitTime}ms, deadline will be missed."
             )
-            throw PaymentRejectedException(Duration.ofMillis(estimatedWaitTime))
+            throw PaymentRejectedException(estimatedCompletionTime)
         }
 
 
@@ -92,7 +93,7 @@ class PaymentExternalSystemAdapterImpl(
                             "Queue size: ${paymentExecutor.queue.size}"
                 )
                 // Возвращаем среднее время ожидания, так как это хороший индикатор времени на "разгрузку"
-                throw PaymentRejectedException(requestAverageProcessingTime)
+//                throw PaymentRejectedException(requestAverageProcessingTime)
             }
         }
     }
