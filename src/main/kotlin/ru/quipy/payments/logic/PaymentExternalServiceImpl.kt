@@ -14,9 +14,15 @@ import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
-import java.util.concurrent.Executors
-import java.util.concurrent.TimeUnit
+import java.util.concurrent.*
 
+
+class PaymentRejectedException(val retryAfter: Duration) :
+    RuntimeException("Payment rejected due to high load. Retry after ${retryAfter.seconds} seconds.") {
+    // Оптимизация: нам не нужен дорогой stack trace для этого типа исключений,
+    // так как это ожидаемое поведение при перегрузке.
+    override fun fillInStackTrace(): Throwable = this
+}
 
 // Advice: always treat time as a Duration
 class PaymentExternalSystemAdapterImpl(
@@ -42,14 +48,51 @@ class PaymentExternalSystemAdapterImpl(
     private val client = OkHttpClient.Builder().build()
     private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
     private val parallelRequestsLimiter = OngoingWindow(parallelRequests)
-    private val paymentExecutor = Executors.newFixedThreadPool(parallelRequests)
+
+    private val queueCapacity = 100
+    private val paymentExecutor: ThreadPoolExecutor = ThreadPoolExecutor(
+        parallelRequests,
+        parallelRequests,
+        60L, TimeUnit.SECONDS,
+        LinkedBlockingQueue<Runnable>(queueCapacity)
+    )
+
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
+        val currentQueueSize = paymentExecutor.queue.size
+        if (currentQueueSize >= queueCapacity) {
+            throw PaymentRejectedException(requestAverageProcessingTime)
+        }
+
+        val estimatedWaitTime = (currentQueueSize / parallelRequests) * requestAverageProcessingTime.toMillis()
+        val estimatedCompletionTime = System.currentTimeMillis() + estimatedWaitTime
+
+        if (estimatedCompletionTime > deadline) {
+            logger.warn(
+                "[$accountName] Rejecting payment $paymentId due to high load. " +
+                        "Queue size: $currentQueueSize, estimated wait: ${estimatedWaitTime}ms, deadline will be missed."
+            )
+            throw PaymentRejectedException(Duration.ofMillis(estimatedWaitTime))
+        }
+
+
         paymentExecutor.submit {
             try {
-                executePayment(paymentId, amount, paymentStartedAt, deadline)
-            } catch (e: Exception) {
-                logger.error("[$accountName] Failed to process payment $paymentId", e)
+                paymentExecutor.submit {
+                    try {
+                        executePayment(paymentId, amount, paymentStartedAt, deadline)
+                    } catch (e: Exception) {
+                        logger.error("[$accountName] Unhandled exception in payment executor for $paymentId", e)
+                    }
+                }
+            } catch (e: RejectedExecutionException) {
+                // Это происходит, когда очередь заполнена. Это наш back pressure!
+                logger.warn(
+                    "[$accountName] Rejecting payment $paymentId because executor queue is full. " +
+                            "Queue size: ${paymentExecutor.queue.size}"
+                )
+                // Возвращаем среднее время ожидания, так как это хороший индикатор времени на "разгрузку"
+                throw PaymentRejectedException(requestAverageProcessingTime)
             }
         }
     }
@@ -100,6 +143,7 @@ class PaymentExternalSystemAdapterImpl(
                         it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
                     }
                 }
+
                 else -> {
                     logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
 

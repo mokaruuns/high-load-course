@@ -3,9 +3,13 @@ package ru.quipy.apigateway
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
+import org.springframework.http.HttpHeaders
+import org.springframework.http.HttpStatus
+import org.springframework.http.ResponseEntity
 import org.springframework.web.bind.annotation.*
 import ru.quipy.orders.repository.OrderRepository
 import ru.quipy.payments.logic.OrderPayer
+import ru.quipy.payments.logic.PaymentRejectedException
 import java.util.*
 
 @RestController
@@ -71,4 +75,22 @@ class APIController {
         val timestamp: Long,
         val transactionId: UUID
     )
+
+    @ExceptionHandler(PaymentRejectedException::class)
+    fun handlePaymentRejected(exception: PaymentRejectedException): ResponseEntity<Map<String, Any>> {
+        logger.warn("Payment rejected due to high load: ${exception.message}") // Не забудьте логгер
+
+        // Формируем правильные заголовки
+        val headers = HttpHeaders()
+        headers.add("Retry-After", exception.retryAfter.seconds.toString())
+
+        // Формируем тело ответа
+        val body = mapOf(
+            "error" to "TOO_MANY_REQUESTS",
+            "message" to "Service is currently overloaded. Please try again later.",
+            "retryAfterSeconds" to exception.retryAfter.seconds
+        )
+
+        return ResponseEntity(body, headers, HttpStatus.TOO_MANY_REQUESTS)
+    }
 }
