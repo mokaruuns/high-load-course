@@ -29,8 +29,8 @@ class OrderPayer {
     private lateinit var paymentService: PaymentService
 
     private val paymentExecutor = ThreadPoolExecutor(
-        110,
-        110,
+        16,
+        16,
         0L,
         TimeUnit.MILLISECONDS,
         LinkedBlockingQueue(),
@@ -48,19 +48,10 @@ class OrderPayer {
         val currQueueSize = paymentExecutor.queue.size
 
 //        PaymentAccountProperties(serviceName=marsel-repo, accountName=acc-18, parallelRequests=10000, rateLimitPerSec=110, price=30, averageProcessingTime=PT1S, enabled=true)
-        val parallelRequests = 10000
-        val rateLimitPerSec = 110
-        val requestAverageProcessingTime = Duration.ofSeconds(1)
 
-        val parallelSpeed = parallelRequests * 1000 / requestAverageProcessingTime.toMillis()
-        val speed = min(parallelSpeed, rateLimitPerSec.toLong())
-        val estimatedWaitTimeInSeconds = currQueueSize.toDouble() / speed
-        val estimatedWaitTime = (estimatedWaitTimeInSeconds * 1000).toLong()
-        val estimatedCompletionTime = createdAt + estimatedWaitTime
-
-        logger.warn("paymentId: {} estimatedWaitTimeInSeconds: {} sec currQueueSize: {}", paymentId, estimatedWaitTimeInSeconds, currQueueSize)
-        if (estimatedCompletionTime > deadline) {
-            throw PaymentRejectedException(estimatedCompletionTime)
+        logger.warn("paymentId: {} currQueueSize: {}", paymentId, currQueueSize)
+        if (currQueueSize > 280) {
+            throw PaymentRejectedException(createdAt + Duration.ofSeconds(1).toMillis())
         }
         paymentExecutor.submit {
             val createdEvent = paymentESService.create {
