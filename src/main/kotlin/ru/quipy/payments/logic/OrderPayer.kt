@@ -12,6 +12,8 @@ import java.util.*
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
+import java.time.Duration
+import kotlin.math.min
 
 @Service
 class OrderPayer {
@@ -31,13 +33,26 @@ class OrderPayer {
         16,
         0L,
         TimeUnit.MILLISECONDS,
-        LinkedBlockingQueue(8_000),
+        LinkedBlockingQueue(),
         NamedThreadFactory("payment-submission-executor"),
         CallerBlockingRejectedExecutionHandler()
     )
 
+    class PaymentRejectedException(val estimatedCompletionTimestamp: Long) :
+        RuntimeException("Payment rejected due to high load. Retry after $estimatedCompletionTimestamp timestamp.") {
+        override fun fillInStackTrace(): Throwable = this
+    }
+
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
         val createdAt = System.currentTimeMillis()
+        val currQueueSize = paymentExecutor.queue.size
+
+//        PaymentAccountProperties(serviceName=marsel-repo, accountName=acc-18, parallelRequests=10000, rateLimitPerSec=110, price=30, averageProcessingTime=PT1S, enabled=true)
+
+        logger.warn("paymentId: {} currQueueSize: {}", paymentId, currQueueSize)
+        if (currQueueSize > 280) {
+            throw PaymentRejectedException(createdAt + Duration.ofSeconds(1).toMillis())
+        }
         paymentExecutor.submit {
             val createdEvent = paymentESService.create {
                 it.create(
@@ -46,7 +61,7 @@ class OrderPayer {
                     amount
                 )
             }
-            logger.trace("Payment ${createdEvent.paymentId} for order $orderId created.")
+            logger.warn("Payment ${createdEvent.paymentId} for order $orderId created.")
 
             paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
         }
