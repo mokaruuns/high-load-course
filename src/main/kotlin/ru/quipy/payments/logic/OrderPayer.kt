@@ -37,6 +37,8 @@ class OrderPayer {
     )
     private val window = Duration.ofSeconds(1)
 
+    private val hardCap1s = FixedWindowRateLimiter(11, 1, TimeUnit.SECONDS)
+
     private val swRL = LeakingBucketRateLimiter(
         rate = 11,
         window = Duration.ofSeconds(1),
@@ -51,6 +53,9 @@ class OrderPayer {
         return if (rem == 0L) windowMs else (windowMs - rem)
     }
 
+    private fun msUntilNextSecond(now: Long): Long =
+        (1000L - (now % 1000L)).let { if (it == 0L) 1000L else it }
+
     class PaymentRejectedException(val estimatedCompletionTimestamp: Long) :
         RuntimeException("Payment rejected due to high load. Retry after $estimatedCompletionTimestamp timestamp.") {
         override fun fillInStackTrace(): Throwable = this
@@ -59,8 +64,11 @@ class OrderPayer {
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
         val createdAt = System.currentTimeMillis()
 
-        if (!swRL.tick()) {
-            val retryAfterMs = msUntilNextDrain(createdAt)
+        val hardCapOk = hardCap1s.tick()
+        val bucketOk  = if (hardCapOk) swRL.tick() else false
+
+        if (!hardCapOk || !bucketOk) {
+            val retryAfterMs = maxOf(msUntilNextSecond(createdAt), msUntilNextDrain(createdAt))
             throw PaymentRejectedException(createdAt + retryAfterMs)
         }
 
