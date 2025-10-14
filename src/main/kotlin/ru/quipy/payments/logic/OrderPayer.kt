@@ -4,10 +4,10 @@ import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.stereotype.Service
-import ru.quipy.common.utils.CallerBlockingRejectedExecutionHandler
-import ru.quipy.common.utils.NamedThreadFactory
+import ru.quipy.common.utils.*
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
+import java.time.Duration
 import java.util.*
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.ThreadPoolExecutor
@@ -36,8 +36,19 @@ class OrderPayer {
         CallerBlockingRejectedExecutionHandler()
     )
 
+    private val  swRL = FixedWindowRateLimiter(11, 1, TimeUnit.SECONDS)
+
+    class PaymentRejectedException(val estimatedCompletionTimestamp: Long) :
+        RuntimeException("Payment rejected due to high load. Retry after $estimatedCompletionTimestamp timestamp.") {
+        override fun fillInStackTrace(): Throwable = this
+    }
+
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
         val createdAt = System.currentTimeMillis()
+
+        if (!swRL.tick()) {
+            throw PaymentRejectedException(createdAt + (1000 - createdAt % 1000))
+        }
         paymentExecutor.submit {
             val createdEvent = paymentESService.create {
                 it.create(
