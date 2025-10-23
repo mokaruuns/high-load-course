@@ -107,8 +107,7 @@ class PaymentExternalSystemAdapterImpl(
                         return
                     }
 
-                    val retryableHttp = (code == 429) || (code in 500..599)
-                    if (!retryableHttp || attempt > maxRetries) {
+                    if (attempt > maxRetries) {
                         logger.warn("[$accountName] Finish without retry. http=$code, attempt=$attempt, txId=$transactionId")
                         return
                     }
