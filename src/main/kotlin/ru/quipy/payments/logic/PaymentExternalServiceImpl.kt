@@ -13,6 +13,7 @@ import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
+import java.util.concurrent.TimeUnit
 
 
 // Advice: always treat time as a Duration
@@ -38,15 +39,10 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
     private val parallelRequestsLimiter = OngoingWindow(parallelRequests)
     private val client = OkHttpClient.Builder()
-        .connectTimeout(Duration.ofSeconds(1))
-        .readTimeout(Duration.ofSeconds(2))
-        .writeTimeout(Duration.ofSeconds(1))
+        .callTimeout(Duration.ofSeconds(2))
         .build()
 
     private val maxRetries = 3
-    private val baseBackoffMs = 300L
-    private val maxBackoffMs = 2000L
-    private val safetyMarginMs = 150L
 
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
@@ -67,7 +63,7 @@ class PaymentExternalSystemAdapterImpl(
 
             try {
                 // быстрая проверка смысла очередной попытки
-                val guardMs = properties.averageProcessingTime.toMillis() + safetyMarginMs
+                val guardMs = properties.averageProcessingTime.toMillis()
                 val remainingMs = deadline - now()
                 if (remainingMs <= guardMs) {
                     paymentESService.update(paymentId) {
@@ -133,12 +129,9 @@ class PaymentExternalSystemAdapterImpl(
                 parallelRequestsLimiter.release()
             }
 
-            // Backoff перед следующей попыткой, но не выходим за дедлайн
-            val guardMs = properties.averageProcessingTime.toMillis() + safetyMarginMs
+            val guardMs = properties.averageProcessingTime.toMillis()
             val remainingMs = deadline - now()
-            val backoff = minOf(baseBackoffMs shl (attempt - 1), maxBackoffMs)
-            val sleepMs = minOf(backoff, maxOf(0L, remainingMs - guardMs))
-            if (sleepMs <= 0L) {
+            if (remainingMs <= guardMs) {
                 paymentESService.update(paymentId) {
                     it.logProcessing(
                         false,
@@ -148,13 +141,6 @@ class PaymentExternalSystemAdapterImpl(
                     )
                 }
                 logger.warn("[$accountName] No time for backoff, stop. txId=$transactionId")
-                return
-            }
-            try {
-                Thread.sleep(sleepMs)
-            } catch (ie: InterruptedException) {
-                Thread.currentThread().interrupt()
-                logger.warn("[$accountName] Backoff interrupted, stop retries. txId=$transactionId")
                 return
             }
         }
