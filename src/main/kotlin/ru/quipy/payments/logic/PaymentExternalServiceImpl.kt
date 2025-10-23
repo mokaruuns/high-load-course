@@ -95,7 +95,7 @@ class PaymentExternalSystemAdapterImpl(
                             "parse_error:${e.message}"
                         )
                     }
-                    logger.warn("[$accountName] Parse error, code=$code, body=$body")
+                    logger.warn("[$accountName] Parse error, code=$code, body=$body, respone=$response, transactionId=$transactionId")
 
                     val success = response.isSuccessful && body.result
                     paymentESService.update(paymentId) {
