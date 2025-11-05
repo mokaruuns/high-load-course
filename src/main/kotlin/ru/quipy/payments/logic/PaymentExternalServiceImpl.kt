@@ -39,7 +39,7 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
     private val parallelRequestsLimiter = OngoingWindow(parallelRequests)
     private val client = OkHttpClient.Builder()
-        .callTimeout(Duration.ofMillis(requestAverageProcessingTime.toMillis() * 2))
+//        .callTimeout(Duration.ofMillis(requestAverageProcessingTime.toMillis() * 2))
         .build()
 
     private val maxRetries = 3
