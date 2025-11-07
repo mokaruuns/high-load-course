@@ -78,7 +78,7 @@ class PaymentExternalSystemAdapterImpl(
                 rateLimiter.tickBlocking()
 
                 val request = Request.Builder().run {
-                    url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
+                    url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount&timeout=1000")
                     post(emptyBody)
                 }.build()
 
