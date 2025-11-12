@@ -2,17 +2,21 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.RequestBody
 import org.slf4j.LoggerFactory
 import ru.quipy.common.utils.OngoingWindow
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
+import java.io.IOException
 import java.net.SocketTimeoutException
+import java.net.URI
+import java.net.http.HttpClient
+import java.net.http.HttpRequest
+import java.net.http.HttpResponse
+import java.net.http.HttpTimeoutException
 import java.time.Duration
 import java.util.*
+import java.util.concurrent.CompletionException
 import java.util.concurrent.TimeUnit
 
 
@@ -27,22 +31,24 @@ class PaymentExternalSystemAdapterImpl(
     companion object {
         val logger = LoggerFactory.getLogger(PaymentExternalSystemAdapter::class.java)
 
-        val emptyBody = RequestBody.create(null, ByteArray(0))
         val mapper = ObjectMapper().registerKotlinModule()
     }
 
     private val serviceName = properties.serviceName
     private val accountName = properties.accountName
     private val requestAverageProcessingTime = properties.averageProcessingTime
+    private val requestTimeout = requestAverageProcessingTime.multipliedBy(2)
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
     private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
     private val parallelRequestsLimiter = OngoingWindow(parallelRequests)
-    private val client = OkHttpClient.Builder()
-        .callTimeout(Duration.ofMillis(requestAverageProcessingTime.toMillis() * 2))
+    private val client = HttpClient.newBuilder()
+        .version(HttpClient.Version.HTTP_2)
+        .connectTimeout(requestAverageProcessingTime)
         .build()
 
     private val maxRetries = 3
+    private val maxAttempts = maxRetries + 1
 
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
@@ -57,93 +63,7 @@ class PaymentExternalSystemAdapterImpl(
         }
         logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
 
-        var attempt = 0
-        while (true) {
-            attempt++
-
-            try {
-                // быстрая проверка смысла очередной попытки
-                val guardMs = properties.averageProcessingTime.toMillis()
-                val remainingMs = deadline - now()
-                if (remainingMs <= guardMs) {
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(false, now(), transactionId, reason = "Stopped before deadline")
-                    }
-                    logger.warn("[$accountName] No time left before deadline, stop retries. txId=$transactionId")
-                    return
-                }
-
-                // лимитируем только на время вызова
-                parallelRequestsLimiter.acquire()
-                rateLimiter.tickBlocking()
-
-                val request = Request.Builder().run {
-                    url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
-                    post(emptyBody)
-                }.build()
-
-                client.newCall(request).execute().use { response ->
-                    val code = response.code
-                    val body = try {
-                        mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
-                    } catch (e: Exception) {
-                        logger.error("[$accountName] Parse error, code=$code", e)
-                        ExternalSysResponse(
-                            transactionId.toString(),
-                            paymentId.toString(),
-                            false,
-                            "parse_error:${e.message}"
-                        )
-                    }
-                    logger.warn("[$accountName] Parse error, code=$code, body=$body, respone=$response, transactionId=$transactionId")
-
-                    val success = response.isSuccessful && body.result
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(success, now(), transactionId, reason = body.message)
-                    }
-
-                    if (success) {
-                        logger.warn("[$accountName] Success on attempt $attempt, txId=$transactionId")
-                        return
-                    }
-
-                    if (attempt > maxRetries) {
-                        logger.warn("[$accountName] Finish without retry. http=$code, attempt=$attempt, txId=$transactionId")
-                        return
-                    }
-                }
-            } catch (e: Exception) {
-                val retryableEx = (e is SocketTimeoutException) || (e is java.io.IOException)
-                paymentESService.update(paymentId) {
-                    it.logProcessing(false, now(), transactionId, reason = e.message ?: e::class.java.simpleName)
-                }
-                if (!retryableEx || attempt > maxRetries) {
-                    logger.error(
-                        "[$accountName] Payment failed (no more retries) on attempt $attempt, txId=$transactionId",
-                        e
-                    )
-                    return
-                }
-                logger.warn("[$accountName] Retryable exception (${e::class.java.simpleName}) on attempt $attempt")
-            } finally {
-                parallelRequestsLimiter.release()
-            }
-
-            val guardMs = properties.averageProcessingTime.toMillis()
-            val remainingMs = deadline - now()
-            if (remainingMs <= guardMs) {
-                paymentESService.update(paymentId) {
-                    it.logProcessing(
-                        false,
-                        now(),
-                        transactionId,
-                        reason = "Stopped before deadline (no time for backoff)"
-                    )
-                }
-                logger.warn("[$accountName] No time for backoff, stop. txId=$transactionId")
-                return
-            }
-        }
+        submitAttempt(paymentId, amount, paymentStartedAt, deadline, transactionId, attempt = 1)
     }
 
     override fun price() = properties.price
@@ -152,6 +72,240 @@ class PaymentExternalSystemAdapterImpl(
 
     override fun name() = properties.accountName
 
+    private fun submitAttempt(
+        paymentId: UUID,
+        amount: Int,
+        paymentStartedAt: Long,
+        deadline: Long,
+        transactionId: UUID,
+        attempt: Int,
+    ) {
+        if (!hasTimeForAttempt(deadline)) {
+            recordDeadlineStop(paymentId, transactionId, "Stopped before deadline")
+            logger.warn("[$accountName] No time left before deadline, stop retries. txId=$transactionId")
+            return
+        }
+
+        try {
+            parallelRequestsLimiter.acquire()
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            logger.warn("[$accountName] Interrupted while acquiring slot, txId=$transactionId")
+            return
+        }
+
+        try {
+            rateLimiter.tickBlocking()
+            val request = HttpRequest.newBuilder()
+                .uri(buildUri(transactionId, paymentId, amount))
+                .timeout(requestTimeout)
+                .POST(HttpRequest.BodyPublishers.noBody())
+                .build()
+
+            client.sendAsync(request, HttpResponse.BodyHandlers.ofString())
+                .orTimeout(requestTimeout.toMillis(), TimeUnit.MILLISECONDS)
+                .whenComplete { response, throwable ->
+                    try {
+                        handleCompletion(
+                            response,
+                            throwable,
+                            paymentId,
+                            amount,
+                            paymentStartedAt,
+                            deadline,
+                            transactionId,
+                            attempt
+                        )
+                    } finally {
+                        parallelRequestsLimiter.release()
+                    }
+                }
+        } catch (e: Exception) {
+            parallelRequestsLimiter.release()
+            handleAttemptException(
+                paymentId,
+                transactionId,
+                attempt,
+                e,
+                amount,
+                paymentStartedAt,
+                deadline
+            )
+        }
+    }
+
+    private fun handleCompletion(
+        response: HttpResponse<String>?,
+        throwable: Throwable?,
+        paymentId: UUID,
+        amount: Int,
+        paymentStartedAt: Long,
+        deadline: Long,
+        transactionId: UUID,
+        attempt: Int,
+    ) {
+        if (throwable != null) {
+            val actual = unwrap(throwable)
+            handleAttemptException(
+                paymentId,
+                transactionId,
+                attempt,
+                actual,
+                amount,
+                paymentStartedAt,
+                deadline
+            )
+            return
+        }
+
+        if (response == null) {
+            handleAttemptException(
+                paymentId,
+                transactionId,
+                attempt,
+                IllegalStateException("Null response"),
+                amount,
+                paymentStartedAt,
+                deadline
+            )
+            return
+        }
+
+        val code = response.statusCode()
+        val body = parseBody(response.body(), paymentId, transactionId, code)
+        val success = code in 200..299 && body.result
+
+        paymentESService.update(paymentId) {
+            it.logProcessing(success, now(), transactionId, reason = body.message)
+        }
+
+        if (success) {
+            logger.warn("[$accountName] Success on attempt $attempt, txId=$transactionId")
+            return
+        }
+
+        logger.warn("[$accountName] Finish attempt $attempt with http=$code, txId=$transactionId, body=$body")
+        if (shouldRetry(attempt)) {
+            retryOrStop(paymentId, amount, paymentStartedAt, deadline, transactionId, attempt)
+        } else {
+            logger.warn("[$accountName] Finish without retry. http=$code, attempt=$attempt, txId=$transactionId")
+        }
+    }
+
+    private fun handleAttemptException(
+        paymentId: UUID,
+        transactionId: UUID,
+        attempt: Int,
+        throwable: Throwable,
+        amount: Int,
+        paymentStartedAt: Long,
+        deadline: Long,
+    ) {
+        paymentESService.update(paymentId) {
+            it.logProcessing(
+                false,
+                now(),
+                transactionId,
+                reason = throwable.message ?: throwable::class.java.simpleName
+            )
+        }
+
+        val retryable = isRetryable(throwable)
+        if (!retryable || !shouldRetry(attempt)) {
+            logger.error(
+                "[$accountName] Payment failed (no more retries) on attempt $attempt, txId=$transactionId",
+                throwable
+            )
+            return
+        }
+
+        logger.warn("[$accountName] Retryable exception (${throwable::class.java.simpleName}) on attempt $attempt")
+        retryOrStop(paymentId, amount, paymentStartedAt, deadline, transactionId, attempt)
+    }
+
+    private fun retryOrStop(
+        paymentId: UUID,
+        amount: Int,
+        paymentStartedAt: Long,
+        deadline: Long,
+        transactionId: UUID,
+        previousAttempt: Int,
+    ) {
+        if (!hasTimeForAttempt(deadline)) {
+            recordDeadlineStop(paymentId, transactionId, "Stopped before deadline (no time for backoff)")
+            logger.warn("[$accountName] No time for backoff, stop. txId=$transactionId")
+            return
+        }
+
+        submitAttempt(
+            paymentId,
+            amount,
+            paymentStartedAt,
+            deadline,
+            transactionId,
+            previousAttempt + 1
+        )
+    }
+
+    private fun parseBody(
+        body: String?,
+        paymentId: UUID,
+        transactionId: UUID,
+        code: Int,
+    ): ExternalSysResponse {
+        return try {
+            mapper.readValue(body, ExternalSysResponse::class.java)
+        } catch (e: Exception) {
+            logger.error("[$accountName] Parse error, code=$code, txId=$transactionId", e)
+            ExternalSysResponse(
+                transactionId.toString(),
+                paymentId.toString(),
+                false,
+                "parse_error:${e.message}"
+            )
+        }
+    }
+
+    private fun hasTimeForAttempt(deadline: Long): Boolean {
+        val guardMs = properties.averageProcessingTime.toMillis()
+        val remainingMs = deadline - now()
+        return remainingMs > guardMs
+    }
+
+    private fun recordDeadlineStop(paymentId: UUID, transactionId: UUID, reason: String) {
+        paymentESService.update(paymentId) {
+            it.logProcessing(false, now(), transactionId, reason = reason)
+        }
+    }
+
+    private fun buildUri(transactionId: UUID, paymentId: UUID, amount: Int): URI {
+        return URI.create(
+            "http://$paymentProviderHostPort/external/process" +
+                "?serviceName=$serviceName" +
+                "&token=$token" +
+                "&accountName=$accountName" +
+                "&transactionId=$transactionId" +
+                "&paymentId=$paymentId" +
+                "&amount=$amount"
+        )
+    }
+
+    private fun shouldRetry(attempt: Int) = attempt < maxAttempts
+
+    private fun unwrap(error: Throwable): Throwable {
+        return if (error is CompletionException && error.cause != null) {
+            error.cause!!
+        } else {
+            error
+        }
+    }
+
+    private fun isRetryable(throwable: Throwable): Boolean {
+        val actual = if (throwable is CompletionException && throwable.cause != null) throwable.cause!! else throwable
+        return actual is IOException ||
+            actual is SocketTimeoutException ||
+            actual is HttpTimeoutException
+    }
 }
 
 public fun now() = System.currentTimeMillis()
